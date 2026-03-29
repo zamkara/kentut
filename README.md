@@ -1,6 +1,6 @@
 # kentut
 
-Small CLI + systemd timer/service to drop Linux page cache when RAM usage crosses a configurable threshold.
+Small systemd timer/service to drop Linux page cache when RAM usage crosses a configurable threshold.
 
 ## What it does
 
@@ -13,7 +13,7 @@ This is useful if you want to keep a repeatable copy of the setup outside `/etc`
 
 ## Files
 
-- `bin/kentut`: main CLI
+- `bin/kentut`: main command
 - `systemd/kentut.service`: oneshot service
 - `systemd/kentut.timer`: periodic timer
 - `systemd/kentut.env`: editable configuration
@@ -30,7 +30,7 @@ This is useful if you want to keep a repeatable copy of the setup outside `/etc`
 ## Install
 
 ```bash
-cd /home/zam/Projects/kentut
+cd ~/Downloads/kentut
 sudo ./install.sh
 ```
 
@@ -64,7 +64,7 @@ Available variables:
 - `COOLDOWN_SECONDS=900`
 - `STATE_FILE=/run/kentut.last`
 
-## CLI
+## command
 
 - `kentut`: run immediately using current threshold
 - `kentut -t 5m`: wait 5 minutes, then run the check
@@ -112,6 +112,6 @@ journalctl -u kentut.service --no-pager
 ## Uninstall
 
 ```bash
-cd /home/zam/Projects/kentut
+cd ~/Downloads/kentut
 sudo ./uninstall.sh
 ```
