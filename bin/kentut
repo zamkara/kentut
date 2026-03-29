@@ -60,6 +60,49 @@ log_msg() {
   fi
 }
 
+load_config() {
+  local line key value
+
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    return
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+
+    if [[ -z "${line}" || "${line}" == \#* ]]; then
+      continue
+    fi
+
+    if [[ "${line}" != *=* ]]; then
+      continue
+    fi
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+
+    case "${key}" in
+      THRESHOLD_PCT)
+        THRESHOLD_PCT="$(parse_threshold "${value}")"
+        ;;
+      COOLDOWN_SECONDS)
+        if [[ "${value}" =~ ^[0-9]+$ ]]; then
+          COOLDOWN_SECONDS="${value}"
+        fi
+        ;;
+      STATE_FILE)
+        if [[ -n "${value}" ]]; then
+          STATE_FILE="${value}"
+        fi
+        ;;
+    esac
+  done < "${CONFIG_FILE}"
+}
+
 notify_msg() {
   local title="$1"
   local body="$2"
@@ -238,7 +281,7 @@ set_threshold_config() {
 }
 
 run_service_action() {
-  local action="$1"
+  local action="$1" result
 
   if (( EUID != 0 )); then
     printf 'kentut needs root for %s. Run with sudo.\n' "${action}" >&2
@@ -248,18 +291,23 @@ run_service_action() {
   case "${action}" in
     enable)
       systemctl enable --now kentut.timer
+      result='enabled'
       ;;
     disable)
       systemctl disable --now kentut.timer
+      result='disabled'
       ;;
     start)
       systemctl start kentut.timer
+      result='started'
       ;;
     stop)
       systemctl stop kentut.timer
+      result='stopped'
       ;;
     restart)
       systemctl restart kentut.timer
+      result='restarted'
       ;;
     *)
       printf 'unknown service action: %s\n' "${action}" >&2
@@ -270,7 +318,7 @@ run_service_action() {
   if (( JSON == 1 )); then
     printf '{"ok":true,"action":"%s","unit":"kentut.timer"}\n' "${action}"
   else
-    printf 'kentut.timer %sd\n' "${action}"
+    printf 'kentut.timer %s\n' "${result}"
   fi
 }
 
@@ -326,6 +374,8 @@ run_once() {
 
   drop_cache
 }
+
+load_config
 
 while (($# > 0)); do
   case "$1" in
