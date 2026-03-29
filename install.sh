@@ -11,7 +11,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "${SCRIPT_DIR}/bin/kentut" /usr/local/bin/kentut
 install -Dm644 "${SCRIPT_DIR}/systemd/kentut.service" /etc/systemd/system/kentut.service
 install -Dm644 "${SCRIPT_DIR}/systemd/kentut.timer" /etc/systemd/system/kentut.timer
-install -Dm644 "${SCRIPT_DIR}/systemd/kentut.env" /etc/default/kentut
+
+if [[ ! -f /etc/default/kentut ]]; then
+  install -Dm644 "${SCRIPT_DIR}/systemd/kentut.env" /etc/default/kentut
+  echo "Config created at /etc/default/kentut"
+else
+  echo "Config preserved at /etc/default/kentut"
+fi
 
 systemctl daemon-reload
 systemctl enable --now kentut.timer
