@@ -1,0 +1,11 @@
+[Unit]
+Description=Check RAM usage and drop page cache when needed
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=30s
+Unit=kentut.service
+
+[Install]
+WantedBy=timers.target

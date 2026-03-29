@@ -1,0 +1,8 @@
+[Unit]
+Description=Drop Linux page cache when RAM usage crosses threshold
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/kentut
+ExecStart=/usr/local/bin/kentut --service

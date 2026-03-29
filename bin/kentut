@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+THRESHOLD_PCT="${THRESHOLD_PCT:-70}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-900}"
+STATE_FILE="${STATE_FILE:-/run/kentut.last}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/default/kentut}"
+
+QUIET=0
+JSON=0
+FORCE=0
+DRY_RUN=0
+STATUS_ONLY=0
+NOTIFY=0
+DELAY_SECONDS=0
+WATCH_INTERVAL=0
+PERSIST_THRESHOLD=""
+SERVICE_ACTION=""
+
+usage() {
+  cat <<'EOF'
+Usage: kentut [options]
+
+Options:
+  -t <duration>  Delay execution. Examples: 5s, 5m, 5h
+  -m <percent>   Override RAM threshold. Examples: 50, 50%
+  --force        Drop cache without checking threshold
+  --dry-run      Simulate the action without dropping cache
+  --status       Show current memory status and exit
+  --watch <dur>  Re-run continuously. Examples: 10s, 5m
+  --set-threshold <percent>
+                 Persist a new threshold to the config file
+  --enable       Enable and start kentut.timer
+  --disable      Disable and stop kentut.timer
+  --start        Start kentut.timer
+  --stop         Stop kentut.timer
+  --restart      Restart kentut.timer
+  --json         Print machine-readable JSON output
+  --notify       Send a desktop notification when supported
+  --service      Quiet mode for systemd
+  -h, --help     Show this help
+
+Examples:
+  kentut
+  kentut -t 5m
+  kentut -t 5s -m 50%
+  kentut -m 50
+  kentut --status
+  kentut --watch 30s --dry-run
+  sudo kentut --set-threshold 55
+  sudo kentut --enable
+  sudo kentut --disable
+  sudo kentut --force
+EOF
+}
+
+log_msg() {
+  if (( QUIET == 0 && JSON == 0 )); then
+    printf '%s\n' "$*"
+  fi
+}
+
+notify_msg() {
+  local title="$1"
+  local body="$2"
+
+  if (( NOTIFY == 0 )); then
+    return
+  fi
+
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "${title}" "${body}" >/dev/null 2>&1 || true
+  fi
+}
+
+parse_duration() {
+  local raw="$1"
+  local value unit
+
+  if [[ ! "${raw}" =~ ^([0-9]+)([smh]?)$ ]]; then
+    printf 'invalid duration: %s\n' "${raw}" >&2
+    exit 2
+  fi
+
+  value="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+
+  case "${unit}" in
+    ""|s) printf '%s\n' "${value}" ;;
+    m) printf '%s\n' "$(( value * 60 ))" ;;
+    h) printf '%s\n' "$(( value * 3600 ))" ;;
+    *) printf 'invalid duration unit: %s\n' "${unit}" >&2; exit 2 ;;
+  esac
+}
+
+parse_threshold() {
+  local raw="${1%\%}"
+
+  if [[ ! "${raw}" =~ ^[0-9]+$ ]]; then
+    printf 'invalid threshold: %s\n' "$1" >&2
+    exit 2
+  fi
+
+  if (( raw < 1 || raw > 100 )); then
+    printf 'threshold must be between 1 and 100: %s\n' "$1" >&2
+    exit 2
+  fi
+
+  printf '%s\n' "${raw}"
+}
+
+sleep_with_countdown() {
+  local remaining="$1"
+
+  if (( remaining <= 0 )); then
+    return
+  fi
+
+  while (( remaining > 0 )); do
+    log_msg "kentut in ${remaining}s..."
+    sleep 1
+    (( remaining -= 1 ))
+  done
+}
+
+read_meminfo() {
+  mem_total_kib="$(awk '/MemTotal:/ { print $2 }' /proc/meminfo)"
+  mem_available_kib="$(awk '/MemAvailable:/ { print $2 }' /proc/meminfo)"
+
+  if [[ -z "${mem_total_kib}" || -z "${mem_available_kib}" || "${mem_total_kib}" -le 0 ]]; then
+    logger -t kentut "unable to read MemTotal/MemAvailable"
+    printf 'unable to read MemTotal/MemAvailable\n' >&2
+    exit 1
+  fi
+
+  used_pct="$(( ((mem_total_kib - mem_available_kib) * 100) / mem_total_kib ))"
+  used_kib="$(( mem_total_kib - mem_available_kib ))"
+}
+
+read_last_run() {
+  local state_dir
+  last_run=0
+
+  if [[ -f "${STATE_FILE}" ]]; then
+    read -r last_run < "${STATE_FILE}" || last_run=0
+  fi
+
+  state_dir="$(dirname "${STATE_FILE}")"
+  if (( EUID == 0 )); then
+    mkdir -p "${state_dir}"
+  fi
+}
+
+emit_status() {
+  local last_run_display cooldown_remaining
+
+  last_run_display="never"
+  cooldown_remaining=0
+  if (( last_run > 0 )); then
+    last_run_display="${last_run}"
+  fi
+
+  if (( COOLDOWN_SECONDS > 0 && last_run > 0 )); then
+    now="$(date +%s)"
+    if (( now - last_run < COOLDOWN_SECONDS )); then
+      cooldown_remaining="$(( COOLDOWN_SECONDS - (now - last_run) ))"
+    fi
+  fi
+
+  if (( JSON == 1 )); then
+    printf '{'
+    printf '"used_pct":%s,' "${used_pct}"
+    printf '"threshold_pct":%s,' "${THRESHOLD_PCT}"
+    printf '"mem_total_kib":%s,' "${mem_total_kib}"
+    printf '"mem_available_kib":%s,' "${mem_available_kib}"
+    printf '"mem_used_kib":%s,' "${used_kib}"
+    printf '"cooldown_seconds":%s,' "${COOLDOWN_SECONDS}"
+    printf '"cooldown_remaining_seconds":%s,' "${cooldown_remaining}"
+    printf '"last_run_epoch":"%s",' "${last_run_display}"
+    printf '"state_file":"%s"' "${STATE_FILE}"
+    printf '}\n'
+    return
+  fi
+
+  printf 'Used RAM: %s%%\n' "${used_pct}"
+  printf 'Threshold: %s%%\n' "${THRESHOLD_PCT}"
+  printf 'MemTotal: %s KiB\n' "${mem_total_kib}"
+  printf 'MemAvailable: %s KiB\n' "${mem_available_kib}"
+  printf 'MemUsed: %s KiB\n' "${used_kib}"
+  printf 'Cooldown: %ss\n' "${COOLDOWN_SECONDS}"
+  printf 'Cooldown Remaining: %ss\n' "${cooldown_remaining}"
+  printf 'Last Run Epoch: %s\n' "${last_run_display}"
+  printf 'State File: %s\n' "${STATE_FILE}"
+}
+
+set_threshold_config() {
+  local target_file tmp_file new_threshold
+
+  new_threshold="$1"
+  target_file="${CONFIG_FILE}"
+
+  if (( EUID != 0 )); then
+    printf 'kentut needs root to persist config. Run with sudo for --set-threshold.\n' >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${target_file}")"
+  tmp_file="$(mktemp)"
+
+  if [[ -f "${target_file}" ]]; then
+    awk -v new_threshold="${new_threshold}" '
+      BEGIN { updated = 0 }
+      /^THRESHOLD_PCT=/ {
+        print "THRESHOLD_PCT=" new_threshold
+        updated = 1
+        next
+      }
+      { print }
+      END {
+        if (!updated) {
+          print "THRESHOLD_PCT=" new_threshold
+        }
+      }
+    ' "${target_file}" > "${tmp_file}"
+  else
+    printf 'THRESHOLD_PCT=%s\nCOOLDOWN_SECONDS=%s\nSTATE_FILE=%s\n' \
+      "${new_threshold}" "${COOLDOWN_SECONDS}" "${STATE_FILE}" > "${tmp_file}"
+  fi
+
+  install -Dm644 "${tmp_file}" "${target_file}"
+  rm -f "${tmp_file}"
+
+  if (( JSON == 1 )); then
+    printf '{"updated":true,"threshold_pct":%s,"config_file":"%s"}\n' "${new_threshold}" "${target_file}"
+  else
+    printf 'Updated threshold to %s%% in %s\n' "${new_threshold}" "${target_file}"
+  fi
+}
+
+run_service_action() {
+  local action="$1"
+
+  if (( EUID != 0 )); then
+    printf 'kentut needs root for %s. Run with sudo.\n' "${action}" >&2
+    exit 1
+  fi
+
+  case "${action}" in
+    enable)
+      systemctl enable --now kentut.timer
+      ;;
+    disable)
+      systemctl disable --now kentut.timer
+      ;;
+    start)
+      systemctl start kentut.timer
+      ;;
+    stop)
+      systemctl stop kentut.timer
+      ;;
+    restart)
+      systemctl restart kentut.timer
+      ;;
+    *)
+      printf 'unknown service action: %s\n' "${action}" >&2
+      exit 2
+      ;;
+  esac
+
+  if (( JSON == 1 )); then
+    printf '{"ok":true,"action":"%s","unit":"kentut.timer"}\n' "${action}"
+  else
+    printf 'kentut.timer %sd\n' "${action}"
+  fi
+}
+
+drop_cache() {
+  local now
+
+  if (( DRY_RUN == 1 )); then
+    log_msg "dry run: would drop page cache at ${used_pct}% used"
+    notify_msg "kentut" "Dry run: cache drop simulated at ${used_pct}% used"
+    return
+  fi
+
+  if (( EUID != 0 )); then
+    printf 'kentut needs root to drop page cache. Run with sudo or via the systemd service.\n' >&2
+    exit 1
+  fi
+
+  now="$(date +%s)"
+  sync
+  echo 3 > /proc/sys/vm/drop_caches
+  printf '%s\n' "${now}" > "${STATE_FILE}"
+
+  logger -t kentut \
+    "dropped page cache at ${used_pct}% used (threshold=${THRESHOLD_PCT}%% cooldown=${COOLDOWN_SECONDS}s)"
+  log_msg "dropped page cache at ${used_pct}% used"
+  notify_msg "kentut" "Dropped page cache at ${used_pct}% used"
+}
+
+run_once() {
+  local now
+
+  sleep_with_countdown "${DELAY_SECONDS}"
+  read_meminfo
+  read_last_run
+
+  if (( STATUS_ONLY == 1 )); then
+    emit_status
+    return
+  fi
+
+  if (( FORCE == 0 && used_pct < THRESHOLD_PCT )); then
+    log_msg "memory usage ${used_pct}%% is below threshold ${THRESHOLD_PCT}%%"
+    return
+  fi
+
+  if (( FORCE == 0 && COOLDOWN_SECONDS > 0 )); then
+    now="$(date +%s)"
+    if (( now - last_run < COOLDOWN_SECONDS )); then
+      log_msg "cooldown active, skipping run"
+      return
+    fi
+  fi
+
+  drop_cache
+}
+
+while (($# > 0)); do
+  case "$1" in
+    -t)
+      shift
+      [[ $# -gt 0 ]] || { printf 'missing value for -t\n' >&2; exit 2; }
+      DELAY_SECONDS="$(parse_duration "$1")"
+      ;;
+    -m)
+      shift
+      [[ $# -gt 0 ]] || { printf 'missing value for -m\n' >&2; exit 2; }
+      THRESHOLD_PCT="$(parse_threshold "$1")"
+      ;;
+    --force)
+      FORCE=1
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      ;;
+    --status)
+      STATUS_ONLY=1
+      ;;
+    --watch)
+      shift
+      [[ $# -gt 0 ]] || { printf 'missing value for --watch\n' >&2; exit 2; }
+      WATCH_INTERVAL="$(parse_duration "$1")"
+      ;;
+    --set-threshold)
+      shift
+      [[ $# -gt 0 ]] || { printf 'missing value for --set-threshold\n' >&2; exit 2; }
+      PERSIST_THRESHOLD="$(parse_threshold "$1")"
+      ;;
+    --enable)
+      SERVICE_ACTION="enable"
+      ;;
+    --disable)
+      SERVICE_ACTION="disable"
+      ;;
+    --start)
+      SERVICE_ACTION="start"
+      ;;
+    --stop)
+      SERVICE_ACTION="stop"
+      ;;
+    --restart)
+      SERVICE_ACTION="restart"
+      ;;
+    --json)
+      JSON=1
+      ;;
+    --notify)
+      NOTIFY=1
+      ;;
+    --service)
+      QUIET=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [[ -n "${PERSIST_THRESHOLD}" ]]; then
+  set_threshold_config "${PERSIST_THRESHOLD}"
+  exit 0
+fi
+
+if [[ -n "${SERVICE_ACTION}" ]]; then
+  run_service_action "${SERVICE_ACTION}"
+  exit 0
+fi
+
+if (( WATCH_INTERVAL > 0 )); then
+  while true; do
+    run_once
+    DELAY_SECONDS=0
+    sleep "${WATCH_INTERVAL}"
+  done
+fi
+
+run_once
